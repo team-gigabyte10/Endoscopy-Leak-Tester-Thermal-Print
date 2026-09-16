@@ -7,10 +7,9 @@ Automated Endoscopy Leak Tester powered by an **ESP32**, featuring precision pre
 ## 🚀 Key Features
 
 - **L293D Solid-State Actuator Driver**: Replaces mechanical relays, driving both the **12V Air Pump** and **3.7V STSY033 Air Release Valve** with built-in inductive flyback protection.
-- **Normally Open (NO) STSY033 Valve Control**:
-  - **At Rest / Idle**: Valve is **OFF** (de-energized) $\rightarrow$ exhaust gate is **OPEN**, keeping the chamber unpressurized at ambient 0 mmHg without consuming power or warming the coil.
-  - **During Testing**: Valve turns **ON** (energized) $\rightarrow$ exhaust gate **CLOSES**, creating an airtight seal to pump up and hold pressure during the 30-second leak test.
-  - **Air Release**: Valve turns **OFF** (de-energized) $\rightarrow$ exhaust gate **OPENS**, releasing pressurized air for 5 seconds down to 0 mmHg.
+- **Normally Closed (NC) STSY033 Valve Control**:
+  - **At Rest / Testing**: Valve is **OFF** (de-energized, 0V) $\rightarrow$ exhaust gate is **CLOSED** by internal spring, holding air pressure securely without consuming power or generating resistor heat.
+  - **Air Release / Venting**: Valve turns **ON** (energized via peak-and-hold PWM) $\rightarrow$ solenoid pulls **OPEN** the exhaust gate, releasing pressurized air for 10 seconds down to 0 mmHg, then shuts back OFF.
 - **Pass / Fail Auditory Feedback**: Distinct melodic chimes via a Piezo speaker (C-major ascending chime for **PASS**, repeating low-frequency warning pulses for **FAIL**).
 - **High-Precision Pressure Monitoring**: Multi-point mapped and auto-zero calibrated readings from the MPX5500DP differential pressure sensor.
 - **NTP-Synchronized RTC**: Syncs time via WiFi on boot, keeping the battery-backed DS3231 RTC accurate down to the second.
@@ -27,7 +26,7 @@ Automated Endoscopy Leak Tester powered by an **ESP32**, featuring precision pre
 | **Start Button** | Normally Open | **GPIO 27** | Connected to GND, uses internal `INPUT_PULLUP` |
 | **Piezo Speaker** | (+) Signal | **GPIO 32** | Tone / alert sound generator |
 | **L293D Input 1A** | Pin 2 | **GPIO 26** | Controls 12V Air Pump (`HIGH` = Run, `LOW` = Stop) |
-| **L293D Input 3A** | Pin 10 | **GPIO 25** | Controls STSY033 Valve (`HIGH` = Close gate & Hold, `LOW` = Open gate & Vent) |
+| **L293D Input 3A** | Pin 10 | **GPIO 25** | Controls STSY033 Valve (`HIGH`/PWM = Open & Vent, `LOW` = Close & Hold) |
 | **DS3231 RTC** | SDA | **GPIO 21** | I2C Data line |
 | **DS3231 RTC** | SCL | **GPIO 22** | I2C Clock line |
 | **LCD 16x2 RS** | RS (Pin 4) | **GPIO 4** | Register Select |
@@ -91,52 +90,63 @@ Automated Endoscopy Leak Tester powered by an **ESP32**, featuring precision pre
   ```
   *(The resistor safely drops ~7.5V, delivering the rated ~3.5V–3.8V across the coil without overheating).*
 
-#### 3. Common Ground Rule:
-All grounds must be tied together:
+#### 3. Common Ground Rule (Star Topology):
+All grounds must be tied together directly at the power supply terminal (Star Ground):
 - **ESP32 GND**
 - **12V DC Power Supply (-) / GND**
 - **5V Logic Supply (-) / GND**
 - **L293D Pins 4, 5, 12, 13**
 - **Air Pump (-)** and **Valve (-)**
+*Never daisy-chain the motor/pump ground through the ESP32 board or thin breadboard rails, which creates ground bounce.*
+
+#### 4. Anti-Brownout & Noise Suppression (Critical):
+When the 12V air pump motor starts up, it draws a massive inrush current spike and produces brush noise that can drop the voltage and reset the ESP32 (Brownout) or scramble the LCD. Add the following components:
+1. **Bulk Electrolytic Capacitor ($470\mu\text{F} - 1000\mu\text{F}$, 25V or 35V)**: Connect directly across the 12V supply rails (`+12V` and `GND`) near L293D Pin 8 to buffer the inrush current surge.
+2. **Noise Suppression Ceramic Capacitor ($0.1\mu\text{F} / 100\text{nF}$)**: Solder directly across the (+) and (-) terminals of the 12V Air Pump motor to absorb high-frequency commutator brush sparking.
+3. **Logic Rail Decoupling ($100\mu\text{F} - 470\mu\text{F}$, 16V)**: Connect across the ESP32 `VIN/5V` and `GND` pin.
+4. **Flyback Diode (1N4007 or 1N5819)**: Place in reverse-bias directly across the pump terminals (Cathode/band $\rightarrow$ `Pump +`, Anode $\rightarrow$ `Pump -`) to absorb back-EMF discharge.
 
 ---
 
-### 🚦 Actuator Control Logic
+### 🚦 Actuator Control Logic (Normally Closed Valve)
 
 | Phase | ESP32 GPIO 26 (`pumpPin`) | ESP32 GPIO 25 (`valvePin`) | System State |
 | :--- | :--- | :--- | :--- |
-| **Idle / Rest** | `LOW` (Pump OFF) | `LOW` (Gate OPEN) | Chamber vented to atmosphere (0 mmHg) |
-| **Pumping** | `HIGH` (Pump ON) | `HIGH` (Gate CLOSED) | Air sealed & pressurizing to target (280 mmHg) |
-| **Holding Test** | `LOW` (Pump OFF) | `HIGH` (Gate CLOSED) | Air chamber sealed, leak test monitoring (30s) |
-| **Exhaust / Vent** | `LOW` (Pump OFF) | `LOW` (Gate OPEN) | Air dumps out through open exhaust port (5s) |
+| **Idle / Rest** | `LOW` (Pump OFF) | `LOW` (Valve OFF / 0V) | Gate CLOSED by internal spring at rest (0 power) |
+| **Pumping** | `HIGH`/PWM (Pump ON) | `LOW` (Valve OFF / 0V) | Gate CLOSED by spring, chamber seals & inflates |
+| **Holding Test** | `LOW` (Pump OFF) | `LOW` (Valve OFF / 0V) | Gate CLOSED by spring, chamber sealed for 30s test |
+| **Exhaust / Vent** | `LOW` (Pump OFF) | `HIGH`/PWM (Valve ON) | Solenoid pulls gate OPEN to dump air (10s) |
 
 ---
 
 ## 🔄 Testing Workflow Sequence
 
 1. **Boot & Auto-Zero**:
-   - The STSY033 valve is **OFF** (gate open to atmosphere), ensuring true 0 mmHg baseline.
+   - The STSY033 valve is **OFF** (0V / gate closed by spring at ambient atmospheric 0 mmHg baseline).
    - The system samples ambient atmospheric pressure with 50 readings to calibrate auto-zero baseline.
    - Brief WiFi check fetches accurate NTP time and updates DS3231 RTC.
    - Ready chime plays on Piezo speaker.
 2. **Start Button Pressed**:
    - Click chirp sounds.
-   - **STSY033 valve turns ON (gate closes tightly to hold pressure)**.
-   - Air pump turns **ON**, pumping up to target pressure (**280 mmHg**).
-   - Safety cutoff stops the pump if pressure is not reached within 40 seconds.
+   - **STSY033 valve remains OFF (gate held closed tightly by internal spring to hold pressure)**.
+   - **Two-Stage Inflation with Settling & Top-Up**:
+     - **Fast Stage**: Air pump starts with soft-start PWM ramp and runs at 100% duty (`255`) up to **240 mmHg**.
+     - **Fine Tuning Stage**: Pump throttles down to gentle PWM (`135`) from 240 to **280 mmHg**, reducing airflow velocity and eliminating dynamic backpressure overshoot.
+     - **Stabilization Settling**: Pump shuts off and system waits **600ms** for airflow kinetic energy to dissipate and electrical lines to stabilize.
+     - **Closed-Loop Top-Up**: The true static settled pressure is sampled with the pump OFF. If it settles slightly below 280 mmHg, calibrated micro-pulses gently nudge static pressure to $\ge$ **280 mmHg**.
+   - Safety cutoff automatically stops the pump and vents if pressure is not reached within 40 seconds.
 3. **Holding Phase (30 seconds)**:
-   - Double-beep signals target pressure reached.
-   - Pump turns **OFF**.
-   - **STSY033 valve remains ON (gate closed)**, sealing the air chamber.
-   - System monitors pressure hold for 30 seconds, updating the LCD in real-time.
+   - Double-beep signals true static target pressure achieved ($\ge 280$ mmHg).
+   - **STSY033 valve remains OFF (gate closed)**, sealing the air chamber with zero power and zero heat.
+   - System records the true static `startPressure` and monitors hold for 30 seconds, updating the LCD in real-time.
 4. **Evaluation & Result Tone**:
    - System evaluates final pressure and drop.
-   - If `endPressure >= 260.0 mmHg` $\rightarrow$ **PASS** (pleasant ascending chime).
-   - If `endPressure < 260.0 mmHg` $\rightarrow$ **FAIL** (repeating low warning pulses).
-5. **Air Exhaust (5 Seconds)**:
-   - **STSY033 valve turns OFF (gate opens naturally)** to exhaust pressurized air to atmosphere.
-   - The LCD displays live pressure drop during the 5-second venting period.
-   - After 5 seconds, venting is complete down to 0 mmHg, and the valve stays OFF at idle.
+   - If `endPressure >= 270.0 mmHg` (drop $\le 10$ mmHg) $\rightarrow$ **PASS** (pleasant ascending chime).
+   - If `endPressure < 270.0 mmHg` (drop $> 10$ mmHg) $\rightarrow$ **FAIL** (repeating low warning pulses).
+5. **Air Exhaust (10 Seconds)**:
+   - **STSY033 valve turns ON (gate opens)**: Energized via pull-in pulse followed by holding PWM to pull the solenoid open against backpressure and exhaust pressurized air to atmosphere.
+   - The LCD displays live pressure drop during the 10-second venting period.
+   - After 10 seconds, venting is complete down to 0 mmHg, and the valve turns **OFF** (gate closes back to rest).
 6. **Thermal Receipt Print**:
    - Connects via Bluetooth to Deli DL-ES421 printer.
    - Prints date, time, target, start, end, drop, and PASS/FAIL result.
@@ -150,6 +160,17 @@ All grounds must be tied together:
 - `Wire` (Built-in)
 - `RTClib` (by Adafruit)
 - `WiFi` (Included in ESP32 Arduino Core)
+
+---
+
+## ⚙️ Arduino IDE Board & Partition Settings
+
+To avoid the `text section exceeds available space in board` compilation error (caused by linking both Bluetooth and WiFi stacks):
+
+1. **Board**: `ESP32 Dev Module`
+2. **Partition Scheme**: **`Huge APP (3MB No OTA/1MB SPIFFS)`**
+3. **Flash Frequency**: `80MHz`
+4. **Upload Speed**: `921600` (or `115200`)
 
 ---
 

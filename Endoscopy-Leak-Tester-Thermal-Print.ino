@@ -4,9 +4,16 @@
 #include "RTClib.h"
 #include <WiFi.h>
 #include "time.h"
+#include "soc/soc.h"             // ESP32 brownout detector control
+#include "soc/rtc_cntl_reg.h"    // ESP32 brownout detector control
 
 // =================================================================
 // PROJECT: Endoscopy Leak Tester with Thermal Print & L293D Driver
+// =================================================================
+// IMPORTANT ARDUINO IDE COMPILATION SETTING:
+//  Because this sketch uses both BluetoothSerial and WiFi stacks,
+//  go to: Tools > Partition Scheme > "Huge APP (3MB No OTA/1MB SPIFFS)"
+//  to prevent the "text section exceeds available space" error.
 // =================================================================
 // Actuators:
 //  - 12V Air Pump via L293D (Input 1A / GPIO 26)
@@ -34,8 +41,8 @@ LiquidCrystal lcd(4, 15, 16, 17, 18, 19);
 RTC_DS3231 rtc;
 
 // --- WiFi & NTP Configuration ---
-const char* ssid       = "Nayem CSE";
-const char* password   = "Nayem2026";
+const char* ssid       = "RFID";
+const char* password   = "rfid2025";
 const char* ntpServer  = "pool.ntp.org";
 const long  gmtOffset_sec = 21600; // +06:00 timezone (Bangladesh)
 const int   daylightOffset_sec = 0;
@@ -54,13 +61,24 @@ const int adcSpan300 = 280; // ADC span for 300 mmHg reference
 const float targetPressure = 280.0;        // Target pressure to reach (mmHg)
 const int testDuration = 30000;            // Leak test duration: 30 seconds (ms)
 const float passPressureThreshold = 270.0; // Minimum pressure at end for PASS (mmHg)
-const unsigned long valveReleaseDuration = 5000; // Venting duration: 5 seconds
+const unsigned long valveReleaseDuration = 10000; // Venting duration: 10 seconds
 
-// --- STSY033 Valve Logic (Normally Open) ---
-// - Valve ON  (HIGH): Energized to CLOSE the exhaust gate and hold pressure
-// - Valve OFF (LOW) : De-energized to OPEN the exhaust gate and release air
-const int VALVE_CLOSE_GATE = HIGH; // ON: Closes gate & seals system to hold pressure
-const int VALVE_OPEN_GATE  = LOW;  // OFF: Opens gate & vents air to atmosphere
+// --- Two-Stage Inflation & Settle Control ---
+// Prevents dynamic airflow backpressure drop when pump stops, ensuring true static 280 mmHg
+const float pumpApproachPressure = 260.0; // Transition to gentle speed (mmHg)
+const int   PUMP_FAST_PWM        = 255;   // Rapid initial inflation
+const int   PUMP_SLOW_PWM        = 135;   // Gentle approach speed (drastically cuts backpressure)
+const int   SETTLE_DELAY_MS      = 600;   // Post-cutoff stabilization delay (ms)
+const int   TOPUP_PULSE_MS       = 140;   // Micro-pulse duration for static pressure top-up (ms)
+const int   TOPUP_PWM            = 150;   // Moderate speed for top-up pulses
+const int   MAX_TOPUP_ATTEMPTS   = 15;    // Safety limit for top-up micro-pulses
+
+// --- STSY033 Valve Control (Normally Closed - Energize to Vent) ---
+// Solenoid is Normally Closed (NC):
+//  - At Rest / Testing (OFF / 0V): Closed by internal spring, seals chamber and holds air (0 power, 0 heat)
+//  - Venting (ON / Energized): Solenoid pulls open exhaust gate to release air to atmosphere
+const int VALVE_PULLIN_PWM = 255; // Full power pulse (80ms) to firmly snap gate open against pressure
+const int VALVE_HOLD_PWM   = 180; // Holding PWM during 5-second vent (keeps resistor cool)
 
 // State Tracking
 bool isTesting = false;
@@ -69,6 +87,9 @@ unsigned long lastDisplayUpdate = 0;
 
 // Function Prototypes
 float readPressure();
+void turnPumpOn();
+void turnPumpOff();
+bool inflateToTargetPressure();
 void closeValveGate();
 void openValveGate();
 void startTest();
@@ -80,14 +101,17 @@ void playPassSound();
 void playFailSound();
 
 void setup() {
+  // Disable ESP32 brownout detector to prevent reboot from brief motor inrush surge
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
 
   // Initialize Actuator & Sensor Pins
   pinMode(pumpPin, OUTPUT);
-  digitalWrite(pumpPin, LOW); // Ensure Pump is OFF initially
+  turnPumpOff();              // Ensure Pump is OFF initially
 
   pinMode(valvePin, OUTPUT);
-  openValveGate();            // Ensure Valve is OFF (Gate is OPEN to atmosphere at rest)
+  closeValveGate();           // Ensure Valve is OFF (NC: Gate is CLOSED at rest, 0V)
 
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
@@ -230,24 +254,51 @@ float readPressure() {
 }
 
 // -----------------------------------------------------------------
-// Valve Gate Control (STSY033 Normally Open Solenoid Valve)
+// Pump Motor Control with PWM Soft-Start
+// Prevents high inrush current spikes that cause ESP32 brownout
+// and LCD blackout resets.
+// -----------------------------------------------------------------
+void turnPumpOn() {
+  Serial.println("Starting pump with soft-start ramp...");
+  // Ramp PWM duty from ~25% to 100% over 250ms to tame current spike
+  for (int duty = 65; duty <= 255; duty += 15) {
+    analogWrite(pumpPin, duty);
+    delay(20);
+  }
+  analogWrite(pumpPin, 255); // Full power
+}
+
+void turnPumpOff() {
+  analogWrite(pumpPin, 0);
+  digitalWrite(pumpPin, LOW);
+}
+
+// -----------------------------------------------------------------
+// Valve Gate Control (Normally Closed Solenoid Valve - STSY033)
+//  - De-energized (0V / LOW): Gate is CLOSED by spring, holds pressure
+//  - Energized (PWM / ON)  : Solenoid pulls OPEN to vent air
 // -----------------------------------------------------------------
 void closeValveGate() {
-  // Energize coil (ON) to close exhaust port and seal air line
-  digitalWrite(valvePin, VALVE_CLOSE_GATE);
+  // De-energize coil (0V) -> internal spring seals gate shut to hold pressure
+  analogWrite(valvePin, 0);
+  digitalWrite(valvePin, LOW);
 }
 
 void openValveGate() {
-  // De-energize coil (OFF) to open exhaust port and vent air to atmosphere
-  digitalWrite(valvePin, VALVE_OPEN_GATE);
+  // Energize coil -> pulls solenoid plunger to OPEN exhaust gate and vent air
+  // Step 1: High pull-in pulse (80ms) to snap open against 280 mmHg backpressure
+  analogWrite(valvePin, VALVE_PULLIN_PWM);
+  delay(80);
+  // Step 2: Hold open with safe PWM for the venting duration (keeps resistor cool)
+  analogWrite(valvePin, VALVE_HOLD_PWM);
 }
 
 // -----------------------------------------------------------------
-// Release Air: Opens gate (Valve OFF) for 5 seconds to vent all pressure
+// Release Air: Opens gate (Valve ON) for 5 seconds to vent all pressure
 // -----------------------------------------------------------------
 void releaseAir(unsigned long durationMs) {
-  Serial.println("Release Valve OFF (Gate OPEN) - Venting air...");
-  openValveGate(); // Valve OFF -> gate opens to atmosphere naturally
+  Serial.println("Release Valve ON (Gate OPEN) - Venting air...");
+  openValveGate(); // Valve ON -> energizes solenoid to open gate and release air
 
   unsigned long startTime = millis();
   while (millis() - startTime < durationMs) {
@@ -260,7 +311,113 @@ void releaseAir(unsigned long durationMs) {
     delay(100);
   }
 
-  Serial.println("Venting complete. Scope is at 0 mmHg.");
+  // De-energize valve after venting is complete (returns to closed rest state)
+  closeValveGate();
+  Serial.println("Venting complete. Scope is at 0 mmHg. Valve OFF.");
+}
+
+// -----------------------------------------------------------------
+// Two-Stage Pressurization with Settling & Closed-Loop Top-Up
+// Solves pneumatic dynamic backpressure drop and ensures the 30s
+// leak test starts at true static target pressure (>= 280 mmHg).
+// -----------------------------------------------------------------
+bool inflateToTargetPressure() {
+  unsigned long pumpStartTime = millis();
+  const unsigned long maxPumpTimeout = 40000; // 40 second safety cutoff
+
+  lcd.clear();
+  lcd.print("Pumping (Fast)...");
+
+  // Stage 1: Fast Inflation with soft-start ramp to 240 mmHg
+  turnPumpOn(); // Ramps duty to PUMP_FAST_PWM (255)
+
+  float currentPressure = 0.0;
+  while (true) {
+    currentPressure = readPressure();
+    lcd.setCursor(0, 1);
+    lcd.print("P: ");
+    lcd.print(currentPressure, 1);
+    lcd.print(" mmHg  ");
+
+    if (millis() - pumpStartTime > maxPumpTimeout) {
+      turnPumpOff();
+      Serial.println("Error: Pump timeout reached during fast inflation!");
+      return false;
+    }
+
+    if (currentPressure >= pumpApproachPressure) {
+      break;
+    }
+  }
+
+  // Stage 2: Gentle approach to target (240 -> 280 mmHg)
+  // Low air velocity cuts dynamic flow resistance & backpressure
+  lcd.clear();
+  lcd.print("Fine Tuning...");
+  analogWrite(pumpPin, PUMP_SLOW_PWM);
+
+  while (true) {
+    currentPressure = readPressure();
+    lcd.setCursor(0, 1);
+    lcd.print("P: ");
+    lcd.print(currentPressure, 1);
+    lcd.print(" mmHg  ");
+
+    if (millis() - pumpStartTime > maxPumpTimeout) {
+      turnPumpOff();
+      Serial.println("Error: Pump timeout reached during fine tuning!");
+      return false;
+    }
+
+    if (currentPressure >= targetPressure) {
+      break;
+    }
+  }
+
+  // Turn pump off immediately
+  turnPumpOff();
+
+  // Stage 3: Pneumatic & Electrical Settling Window
+  // Allows airflow kinetic energy to dissipate and electrical rail/ground to stabilize
+  lcd.clear();
+  lcd.print("Stabilizing...");
+  delay(SETTLE_DELAY_MS);
+
+  // Stage 4: Closed-Loop Micro-Pulse Top-Up
+  // Verify true static settled pressure with pump completely OFF
+  float settledP = readPressure();
+  int topUpAttempts = 0;
+
+  while (settledP < targetPressure && topUpAttempts < MAX_TOPUP_ATTEMPTS) {
+    lcd.setCursor(0, 1);
+    lcd.print("Adj: ");
+    lcd.print(settledP, 1);
+    lcd.print(" mmHg ");
+
+    // Deliver calibrated micro-pulse
+    analogWrite(pumpPin, TOPUP_PWM);
+    delay(TOPUP_PULSE_MS);
+    turnPumpOff();
+
+    // Allow static pressure to equilibrate
+    delay(400);
+    settledP = readPressure();
+    topUpAttempts++;
+
+    if (millis() - pumpStartTime > maxPumpTimeout) {
+      turnPumpOff();
+      Serial.println("Error: Pump timeout reached during top-up stabilization!");
+      return false;
+    }
+  }
+
+  Serial.print("Target settled pressure achieved: ");
+  Serial.print(settledP);
+  Serial.print(" mmHg (Top-ups: ");
+  Serial.print(topUpAttempts);
+  Serial.println(")");
+
+  return true;
 }
 
 // -----------------------------------------------------------------
@@ -270,48 +427,34 @@ void startTest() {
   isTesting = true;
   playStartChirp();
 
-  // Step 1: Turn Valve ON (Closes gate and holds pressure)
+  // Step 1: Ensure Valve is closed (0V / de-energized holds pressure naturally)
   closeValveGate();
   delay(100); // 100ms settling time for solenoid seal
 
-  lcd.clear();
-  lcd.print("Pumping...");
-
-  // Step 2: Turn Air Pump ON
-  digitalWrite(pumpPin, HIGH);
-
-  float currentPressure = 0;
-  unsigned long pumpStartTime = millis();
-  const unsigned long maxPumpTimeout = 40000; // 40 second safety cutoff
-
-  // Pump until target pressure is reached (Valve stays ON holding gate closed)
-  while (currentPressure < targetPressure) {
-    currentPressure = readPressure();
-    lcd.setCursor(0, 1);
-    lcd.print("P: ");
-    lcd.print(currentPressure, 1);
-    lcd.print(" mmHg  ");
-
-    if (millis() - pumpStartTime > maxPumpTimeout) {
-      // Pump timeout error (massive leak or hose disconnected)
-      Serial.println("Error: Pump timeout reached!");
-      break;
-    }
-    delay(80);
+  // Step 2: Intelligent Two-Stage Inflation with Settling & Top-Up
+  bool reachedTarget = inflateToTargetPressure();
+  if (!reachedTarget) {
+    lcd.clear();
+    lcd.print("Inflate Failed!");
+    playFailSound();
+    delay(2000);
+    releaseAir(valveReleaseDuration);
+    isTesting = false;
+    readyStartTime = millis();
+    return;
   }
 
-  // Turn Pump OFF immediately, KEEP Valve ON to hold pressure
-  digitalWrite(pumpPin, LOW);
   playTargetBeep();
 
+  // Baseline static start pressure after full stabilization (guaranteed >= 280 mmHg)
   float startPressure = readPressure();
   lcd.clear();
   lcd.print("Holding 30s...");
 
-  // Step 3: Hold for testDuration (30 seconds) while Valve stays ON (gate closed)
+  // Step 3: Hold for testDuration (30 seconds) while Valve stays OFF (gate closed, holding pressure)
   unsigned long holdStartTime = millis();
   while (millis() - holdStartTime < testDuration) {
-    currentPressure = readPressure();
+    float currentPressure = readPressure();
     lcd.setCursor(0, 1);
     lcd.print("P: ");
     lcd.print(currentPressure, 1);
@@ -340,15 +483,15 @@ void startTest() {
   lcd.print(" mmHg");
   delay(2000);
 
-  // Step 6: Release Air (Turn Valve OFF -> Gate opens for 5 seconds to vent all air)
+  // Step 6: Release Air (Turn Valve ON -> Gate opens for 5 seconds to vent all air)
   lcd.clear();
   lcd.print(passed ? "PASS - Venting" : "FAIL - Venting");
-  releaseAir(valveReleaseDuration); // 5000 ms venting
+  releaseAir(valveReleaseDuration); // 10000 ms venting
 
   // Step 7: Print Thermal Receipt via Bluetooth
   printReport(startPressure, endPressure, pressureDrop, passed);
 
-  // Step 8: Ready for next test (Valve remains OFF / Gate open at idle)
+  // Step 8: Ready for next test (Valve remains OFF / closed at idle)
   delay(3000);
   lcd.clear();
   lcd.print("Ready to Test");
@@ -420,7 +563,7 @@ void printReport(float startP, float endP, float dropP, bool passed) {
     }
 
     SerialBT.println("- - - - - - - - - - - - - - - - "); // Tear line
-    SerialBT.println("\n\n"); // Feed paper
+    SerialBT.println("\n"); // Feed paper
 
     delay(3000);           // Allow printer buffer to complete
     SerialBT.disconnect(); // Disconnect to conserve battery
