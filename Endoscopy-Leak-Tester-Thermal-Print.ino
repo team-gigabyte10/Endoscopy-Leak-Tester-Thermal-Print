@@ -58,16 +58,27 @@ int adcZero = 0;            // Auto-calibrated on startup
 const int adcSpan300 = 280; // ADC span for 300 mmHg reference
 
 // --- Test Parameters ---
-const float targetPressure = 280.0;        // Target pressure to reach (mmHg)
-const int testDuration = 30000;            // Leak test duration: 30 seconds (ms)
-const float passPressureThreshold = 270.0; // Minimum pressure at end for PASS (mmHg)
+const float targetPressure = 320.0;        // Target pressure to reach (mmHg)
+const unsigned long testDuration = 120000; // Leak test duration: 2 minutes (120 seconds in ms)
+const float passPressureThreshold = 310.0; // Minimum pressure at end for PASS (mmHg)
 const unsigned long valveReleaseDuration = 10000; // Venting duration: 10 seconds
 
+// --- Safety & Sensor Protection Thresholds ---
+// Protects endoscope tube from over-inflation if sensor fails, disconnects, or lines pop off
+const int   MIN_VALID_RAW_ADC        = 0;     // 0 ADC is completely normal at ambient rest (0 mmHg)
+const int   MAX_VALID_RAW_ADC        = 4050;  // ADC > 4050 indicates short to rail / sensor saturation
+const float MAX_SAFE_PRESSURE        = 370.0; // Hard blow-off cutoff ceiling (mmHg)
+const unsigned long MAX_PUMP_TIMEOUT = 15000; // Maximum inflation timeout: 15 seconds
+const unsigned long PRESSURE_RISE_TIMEOUT_MS = 3500; // Must see pressure increase within 3.5s
+const float MIN_PRESSURE_RISE_DELTA  = 8.0;   // Minimum pressure rise required within 3.5s (mmHg)
+
+bool sensorFault = false;                     // Global sensor health lockout flag
+
 // --- Two-Stage Inflation & Settle Control ---
-// Prevents dynamic airflow backpressure drop when pump stops, ensuring true static 280 mmHg
-const float pumpApproachPressure = 260.0; // Transition to gentle speed (mmHg)
+// Prevents dynamic airflow backpressure drop when pump stops, ensuring true static 320 mmHg
+const float pumpApproachPressure = 312.0; // Transition to gentle speed (mmHg)
 const int   PUMP_FAST_PWM        = 255;   // Rapid initial inflation
-const int   PUMP_SLOW_PWM        = 135;   // Gentle approach speed (drastically cuts backpressure)
+const int   PUMP_SLOW_PWM        = 195;   // Gentle approach speed with sufficient torque
 const int   SETTLE_DELAY_MS      = 600;   // Post-cutoff stabilization delay (ms)
 const int   TOPUP_PULSE_MS       = 140;   // Micro-pulse duration for static pressure top-up (ms)
 const int   TOPUP_PWM            = 150;   // Moderate speed for top-up pulses
@@ -87,6 +98,9 @@ unsigned long lastDisplayUpdate = 0;
 
 // Function Prototypes
 float readPressure();
+int readRawADC(int samples = 25);
+bool isSensorHealthy();
+void emergencyStop(const char* reason);
 void turnPumpOn();
 void turnPumpOff();
 bool inflateToTargetPressure();
@@ -95,6 +109,7 @@ void openValveGate();
 void startTest();
 void releaseAir(unsigned long durationMs);
 void printReport(float startP, float endP, float dropP, bool passed);
+void playTone(int frequency, int durationMs);
 void playStartChirp();
 void playTargetBeep();
 void playPassSound();
@@ -123,13 +138,31 @@ void setup() {
   lcd.clear();
   lcd.print("Initializing...");
 
-  // Auto-zero calibration at startup (ensure sensor reads 0 mmHg at rest)
+  // Auto-zero calibration at startup with sensor health sanity check
   long sumZero = 0;
   for (int i = 0; i < 50; i++) {
     sumZero += analogRead(sensorPin);
     delay(2);
   }
-  adcZero = sumZero / 50;
+  int startupRaw = sumZero / 50;
+
+  if (startupRaw > MAX_VALID_RAW_ADC) {
+    sensorFault = true;
+    Serial.print("CRITICAL: Sensor fault detected at boot! Raw ADC: ");
+    Serial.println(startupRaw);
+    lcd.clear();
+    lcd.print("ERR: SENSOR FAIL");
+    lcd.setCursor(0, 1);
+    lcd.print("ADC: ");
+    lcd.print(startupRaw);
+    playFailSound();
+    delay(2000);
+  } else {
+    sensorFault = false;
+    adcZero = startupRaw;
+    Serial.print("Sensor calibrated OK. adcZero = ");
+    Serial.println(adcZero);
+  }
 
   // Initialize I2C and RTC (DS3231)
   Wire.begin(21, 22); // SDA = GPIO 21, SCL = GPIO 22
@@ -177,23 +210,63 @@ void setup() {
   SerialBT.begin("ESP32_Master", true);
   Serial.println("Bluetooth master started.");
 
-  // Startup ready sound
-  playStartChirp();
+  if (!sensorFault) {
+    // Startup ready sound
+    playStartChirp();
 
-  lcd.clear();
-  lcd.print("Ready to Test");
-  readyStartTime = millis();
+    lcd.clear();
+    lcd.print("Ready to Test");
+    readyStartTime = millis();
+  } else {
+    readyStartTime = millis();
+  }
 }
 
 void loop() {
+  // If sensor is in fault state, lock out all pump activity and periodically alert
+  if (sensorFault) {
+    static unsigned long lastFaultAlert = 0;
+    if (millis() - lastFaultAlert >= 3000) {
+      lcd.clear();
+      lcd.print("ERR: SENSOR FAIL");
+      lcd.setCursor(0, 1);
+      lcd.print("PUMP LOCKED OUT");
+      playFailSound();
+      lastFaultAlert = millis();
+    }
+
+    // Auto-recovery: if sensor is plugged back in, re-calibrate and restore normal state
+    if (isSensorHealthy()) {
+      int testZero = readRawADC(50);
+      if (testZero <= MAX_VALID_RAW_ADC) {
+        adcZero = testZero;
+        sensorFault = false;
+        lcd.clear();
+        lcd.print("Sensor Restored");
+        playStartChirp();
+        delay(1500);
+        lcd.clear();
+        lcd.print("Ready to Test");
+        readyStartTime = millis();
+      }
+    }
+    return;
+  }
+
   if (!isTesting) {
     // Show live ambient/idle pressure reading after 10 seconds of idle time
     if (millis() - readyStartTime >= 10000) {
       if (millis() - lastDisplayUpdate >= 250) {
-        lcd.setCursor(0, 1);
-        lcd.print("P: ");
-        lcd.print(readPressure(), 1);
-        lcd.print(" mmHg  ");
+        float p = readPressure();
+        if (sensorFault || p < 0.0) {
+          lcd.setCursor(0, 1);
+          lcd.print("ERR: SENSOR!    ");
+        } else {
+          lcd.setCursor(0, 1);
+          lcd.print("P: ");
+          lcd.print(p, 1);
+          lcd.print(" mmHg  ");
+        }
         lastDisplayUpdate = millis();
       }
     }
@@ -202,6 +275,17 @@ void loop() {
     if (digitalRead(buttonPin) == LOW) {
       delay(50); // Debounce
       if (digitalRead(buttonPin) == LOW) {
+        // Pre-flight check: verify sensor is healthy BEFORE running pump
+        if (!isSensorHealthy() || sensorFault) {
+          sensorFault = true;
+          lcd.clear();
+          lcd.print("ERR: SENSOR FAIL");
+          lcd.setCursor(0, 1);
+          lcd.print("PUMP LOCKED OUT");
+          playFailSound();
+          delay(2000);
+          return;
+        }
         startTest();
       }
     }
@@ -209,7 +293,27 @@ void loop() {
 }
 
 // -----------------------------------------------------------------
-// Read & Filter Pressure Sensor (MPX5500DP)
+// Low-Level Sensor Sampling & Health Diagnostics
+// -----------------------------------------------------------------
+int readRawADC(int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(sensorPin);
+    delay(1);
+  }
+  return (int)(sum / samples);
+}
+
+bool isSensorHealthy() {
+  int raw = readRawADC(25);
+  if (raw > MAX_VALID_RAW_ADC) {
+    return false;
+  }
+  return true;
+}
+
+// -----------------------------------------------------------------
+// Read & Filter Pressure Sensor (MPX5500DP) with Safety Interlock
 // -----------------------------------------------------------------
 float readPressure() {
   long sumADC = 0;
@@ -221,6 +325,13 @@ float readPressure() {
   }
 
   float avgADC = (float)sumADC / numSamples;
+
+  // Real-time sanity check on sensor hardware (short to rail)
+  if (avgADC > MAX_VALID_RAW_ADC) {
+    sensorFault = true;
+    return -1.0; // Negative indicates hardware sensor fault
+  }
+
   float deltaADC = avgADC - adcZero;
 
   if (deltaADC <= 0) {
@@ -286,7 +397,7 @@ void closeValveGate() {
 
 void openValveGate() {
   // Energize coil -> pulls solenoid plunger to OPEN exhaust gate and vent air
-  // Step 1: High pull-in pulse (80ms) to snap open against 280 mmHg backpressure
+  // Step 1: High pull-in pulse (80ms) to snap open against 320 mmHg backpressure
   analogWrite(valvePin, VALVE_PULLIN_PWM);
   delay(80);
   // Step 2: Hold open with safe PWM for the venting duration (keeps resistor cool)
@@ -294,7 +405,44 @@ void openValveGate() {
 }
 
 // -----------------------------------------------------------------
-// Release Air: Opens gate (Valve ON) for 5 seconds to vent all pressure
+// Emergency Stop & Depressurization
+// Immediately shuts down pump and opens release valve to protect
+// delicate endoscope channels and seals against overpressure.
+// -----------------------------------------------------------------
+void emergencyStop(const char* reason) {
+  // 1. Cut pump immediately to stop air generation
+  turnPumpOff();
+
+  // 2. Snap valve open immediately to vent air and prevent scope tube rupture
+  openValveGate();
+
+  Serial.print("EMERGENCY STOP TRIGGERED: ");
+  Serial.println(reason);
+
+  // 3. Audio warning alarm
+  playFailSound();
+
+  // 4. LCD Alert
+  lcd.clear();
+  lcd.print("EMERGENCY STOP!");
+  lcd.setCursor(0, 1);
+  lcd.print(reason);
+
+  // 5. Keep venting for 6 seconds to completely depressurize the scope
+  unsigned long ventStart = millis();
+  while (millis() - ventStart < 6000) {
+    delay(100);
+  }
+
+  // 6. Close valve back to rest state
+  closeValveGate();
+
+  isTesting = false;
+  readyStartTime = millis();
+}
+
+// -----------------------------------------------------------------
+// Release Air: Opens gate (Valve ON) for duration to vent all pressure
 // -----------------------------------------------------------------
 void releaseAir(unsigned long durationMs) {
   Serial.println("Release Valve ON (Gate OPEN) - Venting air...");
@@ -306,8 +454,12 @@ void releaseAir(unsigned long durationMs) {
     float currentP = readPressure();
     lcd.setCursor(0, 1);
     lcd.print("Venting: ");
-    lcd.print(currentP, 1);
-    lcd.print(" mmHg ");
+    if (currentP < 0.0) {
+      lcd.print("ERR   ");
+    } else {
+      lcd.print(currentP, 1);
+      lcd.print(" mmHg ");
+    }
     delay(100);
   }
 
@@ -317,40 +469,79 @@ void releaseAir(unsigned long durationMs) {
 }
 
 // -----------------------------------------------------------------
-// Two-Stage Pressurization with Settling & Closed-Loop Top-Up
-// Solves pneumatic dynamic backpressure drop and ensures the 30s
-// leak test starts at true static target pressure (>= 280 mmHg).
+// Two-Stage Pressurization with Safety Watchdogs & Top-Up
+// Solves pneumatic backpressure and enforces strict safety watchdogs
+// to ensure the pump NEVER damages the endoscope tube if sensor fails.
 // -----------------------------------------------------------------
 bool inflateToTargetPressure() {
+  // Pre-flight check: verify sensor hardware before energizing pump
+  if (!isSensorHealthy() || sensorFault) {
+    emergencyStop("Sensor Fault!");
+    return false;
+  }
+
+  float initialPressure = readPressure();
+  if (initialPressure < 0.0) {
+    emergencyStop("Sensor Read Fail");
+    return false;
+  }
+
   unsigned long pumpStartTime = millis();
-  const unsigned long maxPumpTimeout = 40000; // 40 second safety cutoff
+  bool dynamicRiseVerified = false;
 
   lcd.clear();
   lcd.print("Pumping (Fast)...");
 
-  // Stage 1: Fast Inflation with soft-start ramp to 240 mmHg
+  // Stage 1: Fast Inflation with soft-start ramp to 312 mmHg
   turnPumpOn(); // Ramps duty to PUMP_FAST_PWM (255)
 
   float currentPressure = 0.0;
   while (true) {
     currentPressure = readPressure();
+
+    // Check 1: Hardware sensor failure during pump run
+    if (currentPressure < 0.0 || sensorFault) {
+      emergencyStop("Sensor Lost!");
+      return false;
+    }
+
+    // Check 2: Absolute overpressure safety limit (with noise spike verification)
+    if (currentPressure >= MAX_SAFE_PRESSURE) {
+      delay(10);
+      if (readPressure() >= MAX_SAFE_PRESSURE) {
+        emergencyStop("Overpressure!");
+        return false;
+      }
+    }
+
+    // Check 3: Dynamic Rate-of-Rise Watchdog (Crucial Tube Protector)
+    // If pump runs for 3.5 seconds without producing at least 8 mmHg rise,
+    // the sensor is disconnected, tube popped off, or sensing line is dead.
+    if (!dynamicRiseVerified && (millis() - pumpStartTime >= PRESSURE_RISE_TIMEOUT_MS)) {
+      if ((currentPressure - initialPressure) < MIN_PRESSURE_RISE_DELTA) {
+        emergencyStop("No Air Rise/Sens");
+        return false;
+      }
+      dynamicRiseVerified = true;
+    }
+
+    // Check 4: Maximum inflation timeout cutoff (15s)
+    if (millis() - pumpStartTime > MAX_PUMP_TIMEOUT) {
+      emergencyStop("Pump Timeout!");
+      return false;
+    }
+
     lcd.setCursor(0, 1);
     lcd.print("P: ");
     lcd.print(currentPressure, 1);
     lcd.print(" mmHg  ");
-
-    if (millis() - pumpStartTime > maxPumpTimeout) {
-      turnPumpOff();
-      Serial.println("Error: Pump timeout reached during fast inflation!");
-      return false;
-    }
 
     if (currentPressure >= pumpApproachPressure) {
       break;
     }
   }
 
-  // Stage 2: Gentle approach to target (240 -> 280 mmHg)
+  // Stage 2: Gentle approach to target (312 -> 320 mmHg)
   // Low air velocity cuts dynamic flow resistance & backpressure
   lcd.clear();
   lcd.print("Fine Tuning...");
@@ -358,16 +549,32 @@ bool inflateToTargetPressure() {
 
   while (true) {
     currentPressure = readPressure();
+
+    // Hardware sensor failure check
+    if (currentPressure < 0.0 || sensorFault) {
+      emergencyStop("Sensor Lost!");
+      return false;
+    }
+
+    // Absolute overpressure safety limit (with noise spike verification)
+    if (currentPressure >= MAX_SAFE_PRESSURE) {
+      delay(10);
+      if (readPressure() >= MAX_SAFE_PRESSURE) {
+        emergencyStop("Overpressure!");
+        return false;
+      }
+    }
+
+    // Timeout check (15s)
+    if (millis() - pumpStartTime > MAX_PUMP_TIMEOUT) {
+      emergencyStop("Pump Timeout!");
+      return false;
+    }
+
     lcd.setCursor(0, 1);
     lcd.print("P: ");
     lcd.print(currentPressure, 1);
     lcd.print(" mmHg  ");
-
-    if (millis() - pumpStartTime > maxPumpTimeout) {
-      turnPumpOff();
-      Serial.println("Error: Pump timeout reached during fine tuning!");
-      return false;
-    }
 
     if (currentPressure >= targetPressure) {
       break;
@@ -386,8 +593,16 @@ bool inflateToTargetPressure() {
   // Stage 4: Closed-Loop Micro-Pulse Top-Up
   // Verify true static settled pressure with pump completely OFF
   float settledP = readPressure();
-  int topUpAttempts = 0;
+  if (settledP < 0.0 || sensorFault) {
+    emergencyStop("Sensor Lost!");
+    return false;
+  }
+  if (settledP >= MAX_SAFE_PRESSURE) {
+    emergencyStop("Overpressure!");
+    return false;
+  }
 
+  int topUpAttempts = 0;
   while (settledP < targetPressure && topUpAttempts < MAX_TOPUP_ATTEMPTS) {
     lcd.setCursor(0, 1);
     lcd.print("Adj: ");
@@ -402,11 +617,19 @@ bool inflateToTargetPressure() {
     // Allow static pressure to equilibrate
     delay(400);
     settledP = readPressure();
+    if (settledP < 0.0 || sensorFault) {
+      emergencyStop("Sensor Lost!");
+      return false;
+    }
+    if (settledP >= MAX_SAFE_PRESSURE) {
+      emergencyStop("Overpressure!");
+      return false;
+    }
+
     topUpAttempts++;
 
-    if (millis() - pumpStartTime > maxPumpTimeout) {
-      turnPumpOff();
-      Serial.println("Error: Pump timeout reached during top-up stabilization!");
+    if (millis() - pumpStartTime > MAX_PUMP_TIMEOUT) {
+      emergencyStop("Pump Timeout!");
       return false;
     }
   }
@@ -424,21 +647,33 @@ bool inflateToTargetPressure() {
 // Main Leak Test Workflow
 // -----------------------------------------------------------------
 void startTest() {
+  // Pre-flight check: ensure sensor is healthy before proceeding
+  if (!isSensorHealthy() || sensorFault) {
+    sensorFault = true;
+    emergencyStop("Sensor Fault!");
+    return;
+  }
+
   isTesting = true;
   playStartChirp();
+
+  // Safety Pre-Vent: If residual pressure in tube > 60 mmHg, vent first
+  float preCheckP = readPressure();
+  if (preCheckP > 60.0) {
+    Serial.println("Residual pressure detected. Pre-venting...");
+    lcd.clear();
+    lcd.print("Pre-Venting...");
+    releaseAir(3000);
+  }
 
   // Step 1: Ensure Valve is closed (0V / de-energized holds pressure naturally)
   closeValveGate();
   delay(100); // 100ms settling time for solenoid seal
 
-  // Step 2: Intelligent Two-Stage Inflation with Settling & Top-Up
+  // Step 2: Intelligent Two-Stage Inflation with Watchdogs, Settling & Top-Up
   bool reachedTarget = inflateToTargetPressure();
   if (!reachedTarget) {
-    lcd.clear();
-    lcd.print("Inflate Failed!");
-    playFailSound();
-    delay(2000);
-    releaseAir(valveReleaseDuration);
+    // If target was not reached, emergencyStop() has already shut down pump and vented
     isTesting = false;
     readyStartTime = millis();
     return;
@@ -446,15 +681,46 @@ void startTest() {
 
   playTargetBeep();
 
-  // Baseline static start pressure after full stabilization (guaranteed >= 280 mmHg)
+  // Baseline static start pressure after full stabilization (guaranteed >= 320 mmHg)
   float startPressure = readPressure();
   lcd.clear();
-  lcd.print("Holding 30s...");
+  lcd.print("Holding 2m...");
 
-  // Step 3: Hold for testDuration (30 seconds) while Valve stays OFF (gate closed, holding pressure)
+  // Step 3: Hold for testDuration (2 minutes) while Valve stays OFF (gate closed, holding pressure)
   unsigned long holdStartTime = millis();
+  int lastRemainingSec = -1;
   while (millis() - holdStartTime < testDuration) {
     float currentPressure = readPressure();
+
+    // Safety checks during 2 min hold
+    if (currentPressure < 0.0 || sensorFault) {
+      emergencyStop("Sensor Lost Hold");
+      return;
+    }
+    if (currentPressure >= MAX_SAFE_PRESSURE) {
+      delay(10);
+      if (readPressure() >= MAX_SAFE_PRESSURE) {
+        emergencyStop("Hold Overpressure");
+        return;
+      }
+    }
+
+    // Dynamic countdown display on line 0 (e.g., Hold: 1m 59s)
+    unsigned long elapsed = millis() - holdStartTime;
+    int remainingSec = (testDuration > elapsed) ? (int)((testDuration - elapsed + 999) / 1000) : 0;
+    if (remainingSec != lastRemainingSec) {
+      lastRemainingSec = remainingSec;
+      lcd.setCursor(0, 0);
+      lcd.print("Hold: ");
+      int mins = remainingSec / 60;
+      int secs = remainingSec % 60;
+      lcd.print(mins);
+      lcd.print("m ");
+      if (secs < 10) lcd.print("0");
+      lcd.print(secs);
+      lcd.print("s    ");
+    }
+
     lcd.setCursor(0, 1);
     lcd.print("P: ");
     lcd.print(currentPressure, 1);
@@ -464,6 +730,10 @@ void startTest() {
 
   // Step 4: Measure drop and evaluate result
   float endPressure = readPressure();
+  if (endPressure < 0.0 || sensorFault) {
+    emergencyStop("Sensor Lost End");
+    return;
+  }
   float pressureDrop = startPressure - endPressure;
   bool passed = (endPressure >= passPressureThreshold);
 

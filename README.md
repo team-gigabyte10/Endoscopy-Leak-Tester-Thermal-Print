@@ -114,8 +114,40 @@ When the 12V air pump motor starts up, it draws a massive inrush current spike a
 | :--- | :--- | :--- | :--- |
 | **Idle / Rest** | `LOW` (Pump OFF) | `LOW` (Valve OFF / 0V) | Gate CLOSED by internal spring at rest (0 power) |
 | **Pumping** | `HIGH`/PWM (Pump ON) | `LOW` (Valve OFF / 0V) | Gate CLOSED by spring, chamber seals & inflates |
-| **Holding Test** | `LOW` (Pump OFF) | `LOW` (Valve OFF / 0V) | Gate CLOSED by spring, chamber sealed for 30s test |
+| **Holding Test** | `LOW` (Pump OFF) | `LOW` (Valve OFF / 0V) | Gate CLOSED by spring, chamber sealed for 2 min (120s) test |
 | **Exhaust / Vent** | `LOW` (Pump OFF) | `HIGH`/PWM (Valve ON) | Solenoid pulls gate OPEN to dump air (10s) |
+
+---
+
+## 🛡️ Multi-Layer Endoscope Tube & Sensor Protection System
+
+Delicate endoscopes (Olympus, Pentax, Karl Storz, Fujifilm) can suffer catastrophic channel and bending rubber rupture if air is pumped while the pressure sensor is inactive or malfunctioning. The firmware enforces **5 independent hardware & software protection layers**:
+
+1. **Boot-Time Sensor Health Check**:
+   - At power-up, samples the MPX5500DP analog channel on GPIO 34.
+   - Verifies raw ADC is within physical limits ($\le 4050$). Ambient resting pressure at 0 mmHg naturally yields low or zero ADC ($0 \le \text{ADC} \le 4050$). If saturated or shorted to VCC rail ($> 4050$), the system enters lockout mode:
+     - LCD displays: `ERR: SENSOR FAIL` with actual ADC reading.
+     - Audible alarm pulses.
+     - **Pump is 100% blocked from activating**.
+     - Auto-recovers once normal electrical connection is restored.
+
+2. **Pre-Flight Sensor Readiness Validation**:
+   - When the operator presses the Start button, a pre-flight sensor check verifies electrical sanity and confirms tube status before energizing the pump.
+   - If residual trapped pressure is $> 60\text{ mmHg}$, the system automatically pre-vents for 3 seconds before pumping.
+
+3. **Dynamic "Rate-of-Rise" Watchdog (Crucial Tube Protector)**:
+   - If the pneumatic hose to the sensor pops off or the sensor ADC hangs, the sensor might stay at $0\text{ mmHg}$ while the pump forces air into the scope.
+   - Within **$3.5\text{ seconds}$** of pump startup, pressure MUST rise by at least **$+8\text{ mmHg}$**.
+   - If this threshold is not met within 3.5 seconds:
+     - **Pump is killed instantly (`turnPumpOff()`)**.
+     - **Release valve snaps open immediately (`openValveGate()`)** to dump trapped air.
+     - System alarms with `ERR: NO AIR RISE / SENSOR CHECK`.
+
+4. **Hard Overpressure Cutoff ($370\text{ mmHg}$ Ceiling with Noise Rejection)**:
+   - Target pressure is $320\text{ mmHg}$. If verified pressure reaches $\ge 370\text{ mmHg}$ during pumping, settling, or holding, the pump is instantly disabled and the exhaust valve opens.
+
+5. **Maximum Inflation Timeout (15 Seconds)**:
+   - Total inflation timeout is set to **15 seconds**. If the system cannot reach target within 15 seconds, it immediately aborts, shuts off the pump, and vents to atmosphere.
 
 ---
 
@@ -123,26 +155,28 @@ When the 12V air pump motor starts up, it draws a massive inrush current spike a
 
 1. **Boot & Auto-Zero**:
    - The STSY033 valve is **OFF** (0V / gate closed by spring at ambient atmospheric 0 mmHg baseline).
+   - Sensor health check verifies valid raw ADC reading ($\text{ADC} \le 4050$).
    - The system samples ambient atmospheric pressure with 50 readings to calibrate auto-zero baseline.
    - Brief WiFi check fetches accurate NTP time and updates DS3231 RTC.
    - Ready chime plays on Piezo speaker.
 2. **Start Button Pressed**:
    - Click chirp sounds.
-   - **STSY033 valve remains OFF (gate held closed tightly by internal spring to hold pressure)**.
-   - **Two-Stage Inflation with Settling & Top-Up**:
-     - **Fast Stage**: Air pump starts with soft-start PWM ramp and runs at 100% duty (`255`) up to **240 mmHg**.
-     - **Fine Tuning Stage**: Pump throttles down to gentle PWM (`135`) from 240 to **280 mmHg**, reducing airflow velocity and eliminating dynamic backpressure overshoot.
+   - Pre-flight sensor validation runs.
+   - **Two-Stage Inflation with Watchdogs & Top-Up**:
+     - **Fast Stage**: Air pump starts with soft-start PWM ramp and runs at 100% duty (`255`) up to **312 mmHg**.
+     - **Rate-of-Rise Check**: Enforces $\ge 8\text{ mmHg}$ pressure rise within 3.5 seconds.
+     - **Fine Tuning Stage**: Pump throttles to PWM (`195`) from 312 to **320 mmHg**, maintaining sufficient torque against backpressure while eliminating dynamic overshoot.
      - **Stabilization Settling**: Pump shuts off and system waits **600ms** for airflow kinetic energy to dissipate and electrical lines to stabilize.
-     - **Closed-Loop Top-Up**: The true static settled pressure is sampled with the pump OFF. If it settles slightly below 280 mmHg, calibrated micro-pulses gently nudge static pressure to $\ge$ **280 mmHg**.
-   - Safety cutoff automatically stops the pump and vents if pressure is not reached within 40 seconds.
-3. **Holding Phase (30 seconds)**:
-   - Double-beep signals true static target pressure achieved ($\ge 280$ mmHg).
+     - **Closed-Loop Top-Up**: The true static settled pressure is sampled with the pump OFF. If it settles slightly below 320 mmHg, calibrated micro-pulses gently nudge static pressure to $\ge$ **320 mmHg**.
+   - Safety cutoff automatically stops the pump and vents if pressure is not reached within 15 seconds.
+3. **Holding Phase (2 minutes / 120 seconds)**:
+   - Double-beep signals true static target pressure achieved ($\ge 320$ mmHg).
    - **STSY033 valve remains OFF (gate closed)**, sealing the air chamber with zero power and zero heat.
-   - System records the true static `startPressure` and monitors hold for 30 seconds, updating the LCD in real-time.
+   - System monitors hold for 2 minutes with live countdown and continuous sensor integrity & overpressure monitoring.
 4. **Evaluation & Result Tone**:
    - System evaluates final pressure and drop.
-   - If `endPressure >= 270.0 mmHg` (drop $\le 10$ mmHg) $\rightarrow$ **PASS** (pleasant ascending chime).
-   - If `endPressure < 270.0 mmHg` (drop $> 10$ mmHg) $\rightarrow$ **FAIL** (repeating low warning pulses).
+   - If `endPressure >= 310.0 mmHg` (drop $\le 10$ mmHg) $\rightarrow$ **PASS** (pleasant ascending chime).
+   - If `endPressure < 310.0 mmHg` (drop $> 10$ mmHg) $\rightarrow$ **FAIL** (repeating low warning pulses).
 5. **Air Exhaust (10 Seconds)**:
    - **STSY033 valve turns ON (gate opens)**: Energized via pull-in pulse followed by holding PWM to pull the solenoid open against backpressure and exhaust pressurized air to atmosphere.
    - The LCD displays live pressure drop during the 10-second venting period.
