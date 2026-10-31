@@ -14,6 +14,7 @@ Automated Endoscopy Leak Tester powered by an **ESP32**, featuring precision pre
 - **High-Precision Pressure Monitoring**: Multi-point mapped and auto-zero calibrated readings from the MPX5500DP differential pressure sensor.
 - **NTP-Synchronized RTC**: Syncs time via WiFi on boot, keeping the battery-backed DS3231 RTC accurate down to the second.
 - **Bluetooth Thermal Printing**: Generates clean, formatted leak test receipts for clinical records.
+- **Startup 3-Second Auxiliary Relay Port**: Automatically energizes a designated relay output (GPIO 23) for exactly 3 seconds upon ESP32 power-on / reboot, then de-energizes completely.
 
 ---
 
@@ -22,6 +23,7 @@ Automated Endoscopy Leak Tester powered by an **ESP32**, featuring precision pre
 ### ESP32 System Pin Connections
 | Component | Pin / Signal | ESP32 GPIO | Notes |
 | :--- | :--- | :--- | :--- |
+| **Startup Auxiliary Relay** | Control / IN | **GPIO 23** | Energized for 3s on boot, then OFF (`HIGH`/`LOW` configurable) |
 | **MPX5500DP Sensor** | VOUT (Analog) | **GPIO 34** | ADC1_CH6 (Auto-zero calibrated at startup) |
 | **Start Button** | Normally Open | **GPIO 27** | Connected to GND, uses internal `INPUT_PULLUP` |
 | **Piezo Speaker** | (+) Signal | **GPIO 32** | Tone / alert sound generator |

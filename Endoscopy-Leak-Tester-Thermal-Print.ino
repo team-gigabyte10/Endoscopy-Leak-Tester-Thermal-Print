@@ -19,6 +19,7 @@
 //  - 12V Air Pump via L293D (Input 1A / GPIO 26)
 //  - 3.7V STSY033 Air Release Valve via L293D (Input 3A / GPIO 25)
 //  - Piezo Speaker for Pass/Fail audible alerts (GPIO 32)
+//  - Auxiliary Relay Port (GPIO 23): ON for 3s on boot, then OFF
 // Feedback:
 //  - 16x2 LCD Display
 //  - Bluetooth Thermal Receipt Printer (Deli DL-ES421)
@@ -33,6 +34,17 @@ const int pumpPin   = 26; // L293D Input 1A (Controls 12V Air Pump)
 const int valvePin  = 25; // L293D Input 3A (Controls 3.7V STSY033 Release Valve)
 const int buzzerPin = 32; // Piezo Speaker / Buzzer
 const int buttonPin = 27; // Start Button (Active LOW with internal pull-up)
+const int relayPin  = 23; // Startup Auxiliary Relay Port (GPIO 23)
+
+// --- Relay Configuration (3-Second Power-On Pulse) ---
+// Trigger polarity: For Active HIGH relay module use HIGH/LOW.
+// If using an Active LOW optocoupler relay module, switch them (LOW/HIGH).
+#define RELAY_ON   HIGH
+#define RELAY_OFF  LOW
+
+const unsigned long RELAY_PULSE_DURATION_MS = 3000; // Active for 3 seconds
+bool relayActive = false;
+unsigned long relayPowerOnMillis = 0;
 
 // LCD Pins: RS, EN, D4, D5, D6, D7
 LiquidCrystal lcd(4, 15, 16, 17, 18, 19);
@@ -114,6 +126,9 @@ void playStartChirp();
 void playTargetBeep();
 void playPassSound();
 void playFailSound();
+void turnRelayOn();
+void turnRelayOff();
+void checkRelayTimeout();
 
 void setup() {
   // Disable ESP32 brownout detector to prevent reboot from brief motor inrush surge
@@ -122,6 +137,9 @@ void setup() {
   Serial.begin(115200);
 
   // Initialize Actuator & Sensor Pins
+  pinMode(relayPin, OUTPUT);
+  turnRelayOn();              // Energize relay immediately for 3 seconds upon ESP32 power-on
+
   pinMode(pumpPin, OUTPUT);
   turnPumpOff();              // Ensure Pump is OFF initially
 
@@ -179,6 +197,7 @@ void setup() {
   int wifiAttempts = 0;
   while (WiFi.status() != WL_CONNECTED && wifiAttempts < 10) { // Wait up to 5 seconds
     delay(500);
+    checkRelayTimeout(); // Cut relay OFF at exactly 3.0s even while WiFi is waiting
     Serial.print(".");
     wifiAttempts++;
   }
@@ -223,6 +242,9 @@ void setup() {
 }
 
 void loop() {
+  // Check and de-energize startup relay as soon as 3 seconds elapse
+  checkRelayTimeout();
+
   // If sensor is in fault state, lock out all pump activity and periodically alert
   if (sensorFault) {
     static unsigned long lastFaultAlert = 0;
@@ -382,6 +404,28 @@ void turnPumpOn() {
 void turnPumpOff() {
   analogWrite(pumpPin, 0);
   digitalWrite(pumpPin, LOW);
+}
+
+// -----------------------------------------------------------------
+// Relay Port Control (Startup 3-Second Pulse)
+// -----------------------------------------------------------------
+void turnRelayOn() {
+  digitalWrite(relayPin, RELAY_ON);
+  relayActive = true;
+  relayPowerOnMillis = millis();
+  Serial.println("Startup Relay: ON (Active for 3 seconds)");
+}
+
+void turnRelayOff() {
+  digitalWrite(relayPin, RELAY_OFF);
+  relayActive = false;
+  Serial.println("Startup Relay: OFF (De-energized)");
+}
+
+void checkRelayTimeout() {
+  if (relayActive && (millis() - relayPowerOnMillis >= RELAY_PULSE_DURATION_MS)) {
+    turnRelayOff();
+  }
 }
 
 // -----------------------------------------------------------------
